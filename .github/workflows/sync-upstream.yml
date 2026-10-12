@@ -1,48 +1,83 @@
-name: Sync upstream
-
-# 每天自动把上游 MarSeventh/CloudFlare-ImgBed 的改动合并到本仓库
-# 也可以在 Actions 页面点 "Run workflow" 手动触发
-
-on:
-  schedule:
-    # UTC 20:00 == 北京时间次日 04:00
-    - cron: '0 20 * * *'
-  workflow_dispatch:
+name: Upstream Sync
 
 permissions:
   contents: write
+  actions: write
+  issues: write
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # every day
+  workflow_dispatch:
+    inputs:
+      confirm_breaking_update:
+        description: "I have reviewed any compatibility update notice and agree to apply it if present / 我已阅读可能存在的兼容性更新公告，并同意在有此类更新时应用"
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
-  group: sync-upstream
+  group: upstream-sync-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  sync:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream repo
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout target repo
+        uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Merge upstream main
+      - name: Check breaking update policy
+        id: breaking_guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
+          UPSTREAM_BRANCH: main
+          ALLOW_BREAKING_UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_breaking_update == true }}
+        run: bash .github/breaking-updates/scripts/breaking-update-guard.sh check
+
+      - name: Sync upstream changes
+        id: sync
+        if: steps.breaking_guard.outputs.blocked != 'true'
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+
+      - name: Complete breaking update notices
+        if: steps.sync.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/breaking-updates/scripts/breaking-update-guard.sh complete
+
+      - name: Trigger Worker deploy
+        if: steps.sync.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
+
+      - name: Sync failure guidance
+        if: failure() && steps.sync.outcome == 'failure'
         run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git
-          git fetch upstream main --tags
-
-          if git merge --no-edit upstream/main; then
-            if git diff --quiet origin/main HEAD; then
-              echo "上游没有新改动，无需同步。"
-            else
-              git push origin HEAD:main
-            fi
-          else
-            git merge --abort || true
-            echo "::error::与上游存在冲突，已放弃本次合并，请手动处理。"
-            exit 1
-          fi
+          {
+            echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
+            echo
+            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
+            echo
+            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
+            echo
+            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
+            echo
+            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
+          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
+          exit 1
